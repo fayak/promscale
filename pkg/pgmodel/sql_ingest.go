@@ -27,6 +27,8 @@ const (
 	getCreateMetricsTableSQL = "SELECT table_name FROM " + catalogSchema + ".get_or_create_metric_table_name($1)"
 	finalizeMetricCreation   = "CALL " + catalogSchema + ".finalize_metric_creation()"
 	getSeriesIDForLabelSQL   = "SELECT * FROM " + catalogSchema + ".get_or_create_series_id_for_kv_array($1, $2, $3)"
+	getEpochSQL              = "SELECT current_epoch FROM " + catalogSchema + ".ids_epoch LIMIT 1"
+	getDeletedSeriesSql      = "SELECT array_agg(id) ids FROM " + catalogSchema + ".series WHERE delete_epoch >= $1::BIGINT"
 )
 
 type Cfg struct {
@@ -312,17 +314,24 @@ func (p *pgxInserter) getMetricInserter(metric string, errChan chan error) chan 
 }
 
 type insertHandler struct {
-	conn            pgxConn
-	input           chan insertDataRequest
-	pending         *pendingBuffer
-	seriesCache     map[string]SeriesID
-	metricTableName string
-	toCopiers       chan copyRequest
+	conn               pgxConn
+	input              chan insertDataRequest
+	pending            *pendingBuffer
+	seriesCache        map[string]SeriesID
+	reverseCache       map[SeriesID]string
+	seriesCacheEpoch   Epoch
+	seriesCacheRefresh *time.Ticker
+	metricTableName    string
+	toCopiers          chan copyRequest
 }
+
+// epoch for the ID caches, -1 means that the epoch was not set
+type Epoch = int64
 
 type pendingBuffer struct {
 	needsResponse []insertDataTask
 	batch         SampleInfoIterator
+	epoch         Epoch
 }
 
 const (
@@ -338,6 +347,7 @@ var pendingBuffers = sync.Pool{
 		pb := new(pendingBuffer)
 		pb.needsResponse = make([]insertDataTask, 0)
 		pb.batch = NewSampleInfoIterator()
+		pb.epoch = -1
 		return pb
 	},
 }
@@ -372,12 +382,16 @@ func runInserterRoutine(conn pgxConn, input chan insertDataRequest, metricName s
 	}
 
 	handler := insertHandler{
-		conn:            conn,
-		input:           input,
-		pending:         pendingBuffers.Get().(*pendingBuffer),
-		seriesCache:     make(map[string]SeriesID),
-		metricTableName: tableName,
-		toCopiers:       toCopiers,
+		conn:             conn,
+		input:            input,
+		pending:          pendingBuffers.Get().(*pendingBuffer),
+		seriesCache:      make(map[string]SeriesID),
+		reverseCache:     make(map[SeriesID]string),
+		seriesCacheEpoch: -1,
+		// set to run at half our default retention interval
+		seriesCacheRefresh: time.NewTicker(15 * time.Minute),
+		metricTableName:    tableName,
+		toCopiers:          toCopiers,
 	}
 
 	handler.handleReq(firstReq)
@@ -443,14 +457,20 @@ func (h *insertHandler) hasPendingReqs() bool {
 }
 
 func (h *insertHandler) blockingHandleReq() bool {
-	req, ok := <-h.input
-	if !ok {
-		return false
+	for {
+		select {
+		case req, ok := <-h.input:
+			if !ok {
+				return false
+			}
+
+			h.handleReq(req)
+
+			return true
+		case <-h.seriesCacheRefresh.C:
+			h.refreshSeriesCache()
+		}
 	}
-
-	h.handleReq(req)
-
-	return true
 }
 
 func (h *insertHandler) nonblockingHandleReq() bool {
@@ -467,8 +487,8 @@ func (h *insertHandler) handleReq(req insertDataRequest) bool {
 	// we fill in any SeriesIds we have in cache now so we can free any Labels
 	// that are no longer needed, and because the SeriesIds might get flushed.
 	// (neither of these are that critical at the moment)
-	h.fillKnowSeriesIds(req.data)
-	needsFlush := h.pending.addReq(req)
+	_, epoch := h.fillKnowSeriesIds(req.data)
+	needsFlush := h.pending.addReq(req, epoch)
 	if needsFlush {
 		h.flushPending()
 		return true
@@ -479,7 +499,8 @@ func (h *insertHandler) handleReq(req insertDataRequest) bool {
 // Fill in any SeriesIds we already have in cache.
 // This must be idempotent: if called a second time it should not affect any
 // sampleInfo whose series was already set.
-func (h *insertHandler) fillKnowSeriesIds(sampleInfos []samplesInfo) (numMissingSeries int) {
+func (h *insertHandler) fillKnowSeriesIds(sampleInfos []samplesInfo) (numMissingSeries int, epoch Epoch) {
+	epoch = h.seriesCacheEpoch
 	for i, series := range sampleInfos {
 		// When we first create the sampleInfos we should have set the seriesID
 		// to -1 for any series whose labels field is nil. Real seriesIds must
@@ -507,11 +528,13 @@ func (h *insertHandler) flush() {
 
 // Set all unset SeriesIds and flush to the next layer
 func (h *insertHandler) flushPending() {
-	_, err := h.setSeriesIds(h.pending.batch.sampleInfos)
+	_, epoch, err := h.setSeriesIds(h.pending.batch.sampleInfos)
 	if err != nil {
 		h.pending.reportResults(err)
 		return
 	}
+
+	h.pending.addEpoch(epoch)
 
 	h.toCopiers <- copyRequest{h.pending, h.metricTableName}
 	h.pending = pendingBuffers.Get().(*pendingBuffer)
@@ -608,12 +631,28 @@ func doInsert(conn pgxConn, req copyRequest) (err error) {
 	if len(times) != numRows {
 		panic("invalid insert request")
 	}
-	queryString := fmt.Sprintf("INSERT INTO %s(time, value, series_id) SELECT * FROM unnest($1::TIMESTAMPTZ[], $2::DOUBLE PRECISION[], $3::BIGINT[]) a(t,v,s) ORDER BY s,t ON CONFLICT DO NOTHING", pgx.Identifier{dataSchema, req.table}.Sanitize())
+
+	batch := conn.NewBatch()
+
+	epochCheck := fmt.Sprintf("SELECT CASE current_epoch > $1::BIGINT + 1 WHEN true THEN %s.epoch_abort() END FROM %s.ids_epoch LIMIT 1", catalogSchema, catalogSchema)
+	batch.Queue(epochCheck, req.data.epoch)
+
+	dataInsert := fmt.Sprintf("INSERT INTO %s(time, value, series_id) SELECT * FROM unnest($1::TIMESTAMPTZ[], $2::DOUBLE PRECISION[], $3::BIGINT[]) a(t,v,s) ORDER BY s,t ON CONFLICT DO NOTHING", pgx.Identifier{dataSchema, req.table}.Sanitize())
+	batch.Queue(dataInsert, times, vals, series)
+
 	var ct pgconn.CommandTag
-	ct, err = conn.Exec(context.Background(), queryString, times, vals, series)
+	var res pgx.BatchResults
+	res, err = conn.SendBatch(context.Background(), batch)
 	if err != nil {
 		return
 	}
+
+	_, err = res.Exec()
+	if err != nil {
+		return
+	}
+
+	ct, err = res.Exec()
 
 	if int64(numRows) != ct.RowsAffected() {
 		log.Warn("msg", "duplicate data in sample", "table", req.table, "duplicate_count", int64(numRows)-ct.RowsAffected(), "row_count", numRows)
@@ -679,11 +718,11 @@ func (pending *pendingBuffer) reportResults(err error) {
 // and repopulating the cache accordingly.
 // returns: the tableName for the metric being inserted into
 // TODO move up to the rest of insertHandler
-func (h *insertHandler) setSeriesIds(sampleInfos []samplesInfo) (string, error) {
-	numMissingSeries := h.fillKnowSeriesIds(sampleInfos)
+func (h *insertHandler) setSeriesIds(sampleInfos []samplesInfo) (string, Epoch, error) {
+	numMissingSeries, epoch := h.fillKnowSeriesIds(sampleInfos)
 
 	if numMissingSeries == 0 {
-		return "", nil
+		return "", epoch, nil
 	}
 
 	seriesToInsert := make([]*samplesInfo, 0, numMissingSeries)
@@ -711,6 +750,7 @@ func (h *insertHandler) setSeriesIds(sampleInfos []samplesInfo) (string, error) 
 		}
 
 		batch.Queue("BEGIN;")
+		batch.Queue(getEpochSQL)
 		batch.Queue(getSeriesIDForLabelSQL, curr.labels.metricName, curr.labels.names, curr.labels.values)
 		batch.Queue("COMMIT;")
 		numSQLFunctionCalls++
@@ -721,42 +761,115 @@ func (h *insertHandler) setSeriesIds(sampleInfos []samplesInfo) (string, error) 
 
 	br, err := h.conn.SendBatch(context.Background(), batch)
 	if err != nil {
-		return "", err
+		return "", epoch, err
 	}
 	defer br.Close()
 
 	if numSQLFunctionCalls != len(batchSeries) {
-		return "", fmt.Errorf("unexpected difference in numQueries and batchSeries")
+		return "", epoch, fmt.Errorf("unexpected difference in numQueries and batchSeries")
 	}
 
 	var tableName string
 	for i := 0; i < numSQLFunctionCalls; i++ {
 		_, err = br.Exec()
 		if err != nil {
-			return "", err
+			return "", epoch, err
 		}
 		row := br.QueryRow()
+
+		var newEpoch int64
+		row = br.QueryRow()
+		err = row.Scan(newEpoch)
+		if err != nil {
+			return "", epoch, err
+		}
+		if newEpoch < epoch {
+			// it's always safe to stay on an old epoch, so we don't update
+			// the epoch for the cache until we're sure all the queries succeeded
+			epoch = newEpoch
+		}
 
 		var id SeriesID
 		err = row.Scan(&tableName, &id)
 		if err != nil {
-			return "", err
+			return "", epoch, err
 		}
-		h.seriesCache[batchSeries[i][0].labels.String()] = id
+		seriesString := batchSeries[i][0].labels.String()
+		h.seriesCache[seriesString] = id
+		h.reverseCache[id] = seriesString
 		for _, lsi := range batchSeries[i] {
 			lsi.seriesID = id
 		}
+
 		_, err = br.Exec()
 		if err != nil {
-			return "", err
+			return "", epoch, err
 		}
 	}
 
-	return tableName, nil
+	return tableName, epoch, nil
 }
 
-func (p *pendingBuffer) addReq(req insertDataRequest) bool {
+func (h *insertHandler) refreshSeriesCache() {
+	deletedSeries, newEpoch, err := h.getDeletedSeries()
+	if err != nil {
+		// we don't have any great place to report this error, and if the
+		// connection recovers we can still make progress, so we'll just log it
+		// and continue execution
+		msg := fmt.Sprintf("error refreshing the series cache for %s", h.metricTableName)
+		log.Error("msg", msg, "err", err)
+		return
+	}
+
+	for _, id := range deletedSeries {
+		seriesString, ok := h.reverseCache[SeriesID(id)]
+		if !ok {
+			continue
+		}
+		delete(h.reverseCache, SeriesID(id))
+		delete(h.seriesCache, seriesString)
+	}
+
+	h.seriesCacheEpoch = newEpoch
+}
+
+func (h *insertHandler) getDeletedSeries() ([]int64, Epoch, error) {
+	batch := h.conn.NewBatch()
+
+	batch.Queue(getDeletedSeriesSql, h.seriesCacheEpoch)
+	batch.Queue(getEpochSQL)
+
+	res, err := h.conn.SendBatch(context.Background(), batch)
+	if err != nil {
+		return nil, -1, err
+	}
+
+	var deletedIDs []int64
+	row := res.QueryRow()
+	err = row.Scan(&deletedIDs)
+	if err != nil {
+		return nil, -1, err
+	}
+
+	var newEpoch int64
+	res.QueryRow()
+	err = row.Scan(&newEpoch)
+	if err != nil {
+		return deletedIDs, -1, err
+	}
+
+	return deletedIDs, newEpoch, nil
+}
+
+func (p *pendingBuffer) addReq(req insertDataRequest, epoch Epoch) bool {
+	p.addEpoch(epoch)
 	p.needsResponse = append(p.needsResponse, insertDataTask{finished: req.finished, errChan: req.errChan})
 	p.batch.sampleInfos = append(p.batch.sampleInfos, req.data...)
 	return len(p.batch.sampleInfos) > flushSize
+}
+
+func (p *pendingBuffer) addEpoch(epoch Epoch) {
+	if p.epoch == -1 || epoch < p.epoch {
+		p.epoch = epoch
+	}
 }
